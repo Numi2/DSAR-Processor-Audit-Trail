@@ -1,0 +1,310 @@
+# Serverless Framework configuration for the DSAR Processor
+# This stack recreates the architecture described in the prompt using only
+# seven managed AWS services plus three Lambda functions and a single Step
+# Functions state-machine.
+#
+# Prerequisites:
+#   npm install -g serverless serverless-step-functions
+#
+# Deployment:
+#   sls deploy --stage dev
+
+service: dsar-processor
+
+frameworkVersion: '3'
+
+plugins:
+  - serverless-step-functions
+
+provider:
+  name: aws
+  runtime: python3.11
+  region: us-east-1
+  httpApi:
+    authorizers:
+      cognito:
+        identitySource: '$request.header.Authorization'
+        issuerUrl: https://example.auth.us-east-1.amazoncognito.com
+        audience:
+          - exampleaudienceid123   # TODO replace with actual app-client-id
+  environment:
+    DSAR_TABLE: ${self:custom.dsarTableName}
+    DSAR_BUCKET: ${self:custom.exportBucketName}
+    LEDGER_NAME: DSARLedger
+  iamRoleStatements:
+    # Generic access permissions – tighten in production
+    - Effect: Allow
+      Action:
+        - dynamodb:PutItem
+        - dynamodb:UpdateItem
+        - dynamodb:GetItem
+        - dynamodb:Query
+      Resource:
+        - arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:custom.dsarTableName}
+
+    - Effect: Allow
+      Action:
+        - sqs:SendMessage
+      Resource:
+        - arn:aws:sqs:${aws:region}:${aws:accountId}:${self:custom.queueName}
+
+    - Effect: Allow
+      Action:
+        - s3:PutObject
+        - s3:GetObject
+        - s3:ListBucket
+      Resource:
+        - arn:aws:s3:::${self:custom.exportBucketName}
+        - arn:aws:s3:::${self:custom.exportBucketName}/*
+
+    - Effect: Allow
+      Action:
+        - qldb:SendCommand
+      Resource: arn:aws:qldb:${aws:region}:${aws:accountId}:ledger/DSARLedger
+
+    - Effect: Allow
+      Action:
+        - kms:Encrypt
+        - kms:Decrypt
+      Resource: '*'
+
+    - Effect: Allow
+      Action:
+        - sns:Publish
+      Resource:
+        - arn:aws:sns:${aws:region}:${aws:accountId}:${self:custom.topicName}
+
+    - Effect: Allow
+      Action:
+        - states:StartExecution
+      Resource:
+        - arn:aws:states:${aws:region}:${aws:accountId}:stateMachine:${self:service}-${sls:stage}-state-machine
+
+
+custom:
+  stage: ${opt:stage, 'dev'}
+  dsarTableName: DSARJobs-${sls:stage}
+  queueName: dsar-queue-${sls:stage}
+  exportBucketName: dsar-exports-${sls:stage}-${aws:accountId}
+  topicName: dsar-notify-${sls:stage}
+
+functions:
+  intake:
+    description: Create DSAR job and enqueue message
+    handler: src/intake.handler
+    timeout: 10
+    memorySize: 256
+    events:
+      - httpApi:
+          path: /dsar
+          method: post
+          authorizer: cognito
+    environment:
+      QUEUE_URL:
+        Ref: DSARQueue
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource: arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:custom.dsarTableName}
+      - Effect: Allow
+        Action:
+          - sqs:SendMessage
+        Resource: arn:aws:sqs:${aws:region}:${aws:accountId}:${self:custom.queueName}
+
+  dispatcher:
+    description: SQS consumer that triggers Step Functions execution
+    handler: src/dispatcher.handler
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [ DSARQueue, Arn ]
+          batchSize: 10
+    environment:
+      STATE_MACHINE_ARN: arn:aws:states:${aws:region}:${aws:accountId}:stateMachine:${self:service}-${sls:stage}-state-machine
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - states:StartExecution
+        Resource: '*'
+
+  status:
+    description: Provide job status (meta/events/download)
+    handler: src/status.handler
+    events:
+      - httpApi:
+          path: /dsar/{jobId}
+          method: get
+          authorizer: cognito
+      - httpApi:
+          path: /dsar/{jobId}/{proxy+}
+          method: get
+          authorizer: cognito
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+        Resource: arn:aws:dynamodb:${aws:region}:${aws:accountId}:table/${self:custom.dsarTableName}
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:ListBucket
+        Resource:
+          - arn:aws:s3:::${self:custom.exportBucketName}
+          - arn:aws:s3:::${self:custom.exportBucketName}/*
+
+  dsarWorker:
+    description: Handle export/delete against an individual data store.
+    handler: src/dsar_worker.handler
+    timeout: 30
+    memorySize: 512
+
+  exportBundler:
+    description: Collate per-store exports into a single encrypted bundle.
+    handler: src/export_bundler.handler
+    timeout: 60
+    memorySize: 512
+
+  finalizeDsar:
+    description: Persist job status and fan-out notifications.
+    handler: src/finalize_dsar.handler
+    timeout: 15
+    memorySize: 256
+    environment:
+      TOPIC_ARN:
+        Ref: NotificationTopic
+
+# -------------------------
+# Step-Functions definition
+# -------------------------
+
+stepFunctions:
+  stateMachines:
+    dsarStateMachine:
+      name: ${self:service}-${sls:stage}-state-machine
+      definition:
+        Comment: "Fan-out over stores, optionally bundle exports, then finalize."
+        StartAt: FanOut
+        States:
+          FanOut:
+            Type: Map
+            ItemsPath: $.dataStores
+            Parameters:
+              jobId.$: $.jobId
+              store.$: $$.Map.Item.Value
+              action.$: $.action
+            Iterator:
+              StartAt: HandleStore
+              States:
+                HandleStore:
+                  Type: Task
+                  Resource:
+                    Fn::GetAtt: [ dsarWorkerLambdaFunction, Arn ]
+                  Retry:
+                    - ErrorEquals: ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"]
+                      IntervalSeconds: 2
+                      MaxAttempts: 2
+                      BackoffRate: 2
+                  Catch:
+                    - ErrorEquals: ["States.ALL"]
+                      Next: RecordFailure
+                  Next: RecordEvent
+                RecordFailure:
+                  Type: Pass
+                  ResultPath: $.error
+                  Next: RecordEvent
+                RecordEvent:
+                  Type: Task
+                  Resource: arn:aws:states:::qldb:insertDocument
+                  Parameters:
+                    LedgerName: DSARLedger
+                    Document:
+                      jobId.$: $.jobId
+                      timestamp.$: $$.State.EnteredTime
+                      store.$: $.store
+                      action.$: $.action
+                      status: COMPLETED
+                  End: true
+            Next: PackageDecision
+
+          PackageDecision:
+            Type: Choice
+            Choices:
+              - Variable: $.action
+                StringEquals: export
+                Next: BundleExport
+            Default: Finalize
+
+          BundleExport:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ exportBundlerLambdaFunction, Arn ]
+            Next: Finalize
+
+          Finalize:
+            Type: Task
+            Resource:
+              Fn::GetAtt: [ finalizeDsarLambdaFunction, Arn ]
+            End: true
+
+# ----------
+# Resources
+# ----------
+
+resources:
+  Resources:
+    DSARJobsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.dsarTableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: pk
+            AttributeType: S
+          - AttributeName: sk
+            AttributeType: S
+        KeySchema:
+          - AttributeName: pk
+            KeyType: HASH
+          - AttributeName: sk
+            KeyType: RANGE
+
+    DSARQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.queueName}
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt: [ DSARDeadLetterQueue, Arn ]
+          maxReceiveCount: 5
+
+    DSARDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:custom.queueName}-dlq
+
+    DSARLedger:
+      Type: AWS::QLDB::Ledger
+      Properties:
+        Name: DSARLedger
+        PermissionsMode: STANDARD
+
+    ExportBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.exportBucketName}
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: aws:kms
+
+    NotificationTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:custom.topicName}
+
+  Outputs:
+    StateMachineArn:
+      Description: ARN of the DSAR Step-Functions state-machine
+      Value:
+        Ref: DsarStateMachine
